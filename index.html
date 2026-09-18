@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>YOLO - Detección de Objetos</title>
+    <!-- Cargar TensorFlow.js -->
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs"></script>
+    <!-- Cargar modelo COCO-SSD (implementación YOLO para JS) -->
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd"></script>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            background-color: #000;
+        }
+        #video-container {
+            position: relative;
+            width: 100vw;
+            height: auto;
+        }
+        #camera-video {
+            width: 100%;
+            height: auto;
+            display: block;
+        }
+        #overlay-canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: auto;
+            z-index: 2;
+        }
+    </style>
+</head>
+<body>
+    <div id="video-container">
+        <video id="camera-video" autoplay playsinline></video>
+        <canvas id="overlay-canvas"></canvas>
+    </div>
+ 
+    <script>
+        // Elementos DOM
+        const videoElement = document.getElementById('camera-video');
+        const canvasElement = document.getElementById('overlay-canvas');
+        const ctx = canvasElement.getContext('2d');
+ 
+        // Variables globales
+        let model = null;
+        let videoStream = null;
+        let isDetecting = false;
+ 
+        // Iniciar cámara trasera
+        async function iniciarCamara() {
+            try {
+                videoStream = await navigator.mediaDevices.getUserMedia({
+                    video: {
+                        facingMode: 'environment',
+                        width: { ideal: 1920 },
+                        height: { ideal: 1080 }
+                    }
+                });
+                videoElement.srcObject = videoStream;
+            } catch (error) {
+                console.error('Error al acceder a la cámara:', error);
+                alert('No se pudo acceder a la cámara. Verifique los permisos.');
+            }
+        }
+ 
+        // Cargar modelo YOLO
+        async function cargarModelo() {
+            try {
+                model = await cocoSsd.load();
+                console.log('Modelo YOLO cargado');
+            } catch (error) {
+                console.error('Error al cargar el modelo:', error);
+                alert('Error al cargar el modelo de detección');
+            }
+        }
+ 
+        // Detección en tiempo real
+        async function detectarObjetos() {
+            if (!model || isDetecting) return;
+ 
+            isDetecting = true;
+            canvasElement.width = videoElement.videoWidth;
+            canvasElement.height = videoElement.videoHeight;
+ 
+            try {
+                const predictions = await model.detect(videoElement);
+                dibujarPredicciones(predictions);
+            } catch (error) {
+                console.error('Error en detección:', error);
+            }
+ 
+            isDetecting = false;
+            requestAnimationFrame(detectarObjetos);
+        }
+ 
+        // Dibujar predicciones en canvas
+        function dibujarPredicciones(predictions) {
+            ctx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+            
+            if (predictions.length === 0) return;
+            
+            // Estilo de las marcas
+            const estilos = {
+                color: '#00FF00',
+                grosorLinea: 2,
+                tamañoFuente: '16px sans-serif',
+                margenTexto: 5
+            };
+ 
+            predictions.forEach(prediction => {
+                // Dibujar rectángulo
+                ctx.beginPath();
+                ctx.rect(...prediction.bbox);
+                ctx.lineWidth = estilos.grosorLinea;
+                ctx.strokeStyle = estilos.color;
+                ctx.fillStyle = `${estilos.color}20`;
+                ctx.stroke();
+                ctx.fill();
+ 
+                // Dibujar etiqueta
+                const texto = `${prediction.class} (${Math.round(prediction.score * 100)}%)`;
+                ctx.font = estilos.tamañoFuente;
+                ctx.fillStyle = estilos.color;
+                ctx.fillText(
+                    texto,
+                    prediction.bbox[0] + estilos.margenTexto,
+                    prediction.bbox[1] + estilos.margenTexto + 16
+                );
+            });
+        }
+ 
+        // Iniciar aplicación
+        async function iniciarAplicacion() {
+            await iniciarCamara();
+            await cargarModelo();
+            videoElement.onloadedmetadata = () => {
+                detectarObjetos();
+            };
+        }
+ 
+        // Manejo de cierre
+        window.addEventListener('beforeunload', () => {
+            if (videoStream) {
+                videoStream.getTracks().forEach(track => track.stop());
+            }
+        });
+ 
+        // Iniciar
+        window.onload = iniciarAplicacion;
+    </script>
+</body>
+</html>
