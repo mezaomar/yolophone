@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+<meta name="theme-color" content="#000000" />
+<title>COCO-SSD · Camera</title>
+<style>
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: #000;
+    color: #fff;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    overflow-x: hidden;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  /* ---------- Video ---------- */
+  #video {
+    display: block;
+    width: 100%;
+    height: auto;
+    background: #000;
+  }
+
+  /* ---------- Floating counter label ---------- */
+  #counter {
+    position: fixed;
+    top: calc(12px + env(safe-area-inset-top, 0px));
+    left: calc(12px + env(safe-area-inset-left, 0px));
+    z-index: 20;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 14px;
+    border-radius: 999px;
+    background: rgba(0, 0, 0, 0.60);
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.45);
+    font-size: 15px;
+    font-weight: 600;
+    letter-spacing: 0.3px;
+    color: #fff;
+    pointer-events: none;
+    user-select: none;
+    white-space: nowrap;
+  }
+
+  #counter .dot {
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    background: #ff5252;
+    box-shadow: 0 0 8px #ff5252;
+    transition: background 0.25s, box-shadow 0.25s;
+  }
+  #counter.has-objects .dot {
+    background: #4caf50;
+    box-shadow: 0 0 8px #4caf50;
+  }
+
+  #counter .num {
+    font-variant-numeric: tabular-nums;
+    min-width: 1ch;
+    text-align: center;
+  }
+
+  #counter .label {
+    font-weight: 500;
+    opacity: 0.8;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+  }
+
+  /* ---------- Error modal ---------- */
+  .modal {
+    position: fixed;
+    inset: 0;
+    z-index: 100;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+    background: rgba(0, 0, 0, 0.75);
+    backdrop-filter: blur(3px);
+    -webkit-backdrop-filter: blur(3px);
+  }
+  .modal.show { display: flex; }
+
+  .modal-box {
+    width: 100%;
+    max-width: 380px;
+    background: #1c1c1e;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 16px;
+    padding: 22px 20px 18px;
+    box-shadow: 0 18px 50px rgba(0, 0, 0, 0.6);
+    text-align: center;
+    animation: pop 0.18s ease-out;
+  }
+
+  @keyframes pop {
+    from { transform: scale(0.92); opacity: 0; }
+    to   { transform: scale(1);    opacity: 1; }
+  }
+
+  .modal-box h2 {
+    margin: 0 0 10px;
+    font-size: 17px;
+    font-weight: 700;
+  }
+
+  .modal-box p {
+    margin: 0 0 18px;
+    font-size: 14px;
+    line-height: 1.5;
+    color: #d0d0d5;
+    word-break: break-word;
+  }
+
+  .modal-box button {
+    width: 100%;
+    padding: 12px 16px;
+    font-size: 15px;
+    font-weight: 600;
+    color: #fff;
+    background: #0a84ff;
+    border: 0;
+    border-radius: 10px;
+    cursor: pointer;
+  }
+  .modal-box button:active { background: #0060df; }
+</style>
+</head>
+<body>
+
+  <!-- Camera feed -->
+  <video id="video" autoplay muted playsinline webkit-playsinline></video>
+
+  <!-- Floating object counter -->
+  <div id="counter" aria-live="polite">
+    <span class="dot"></span>
+    <span class="num" id="counter-num">0</span>
+    <span class="label">objects</span>
+  </div>
+
+  <!-- Error modal -->
+  <div class="modal" id="modal" role="alertdialog" aria-modal="true" aria-labelledby="modal-title">
+    <div class="modal-box">
+      <h2 id="modal-title">⚠️ Something went wrong</h2>
+      <p id="modal-msg"></p>
+      <button type="button" id="modal-close">OK</button>
+    </div>
+  </div>
+
+  <!-- Load TensorFlow.js (required for coco-ssd) -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs"></script>
+  <!-- Load the coco-ssd model -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd"></script>
+
+  <script>
+  (function () {
+    'use strict';
+
+    // ---------- DOM refs ----------
+    const video      = document.getElementById('video');
+    const counterEl  = document.getElementById('counter');
+    const counterNum = document.getElementById('counter-num');
+    const modal      = document.getElementById('modal');
+    const modalMsg   = document.getElementById('modal-msg');
+    const modalClose = document.getElementById('modal-close');
+
+    // ---------- State ----------
+    let model = null;
+    let isDetecting = false;
+
+    // ---------- Error helper: console + popup modal ----------
+    function reportError(title, err) {
+      const detail = (err && (err.message || err.toString())) || 'Unknown error';
+      console.error('[' + title + ']', err);
+      modalMsg.textContent = detail;
+      modal.classList.add('show');
+    }
+
+    modalClose.addEventListener('click', function () {
+      modal.classList.remove('show');
+    });
+
+    // Catch anything unexpected that escapes the try/catch blocks
+    window.addEventListener('error', function (e) {
+      reportError('Unhandled error', e.error || e.message);
+    });
+    window.addEventListener('unhandledrejection', function (e) {
+      reportError('Unhandled promise rejection', e.reason);
+    });
+
+    // ---------- Camera ----------
+    async function setupCamera() {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        throw new Error(
+          'Camera API is not available. Make sure the page is served over HTTPS (or localhost) and that your browser supports getUserMedia.'
+        );
+      }
+
+      const constraints = {
+        audio: false,
+        video: {
+          facingMode: { ideal: 'environment' }, // back camera
+          width:  { ideal: 1280 },
+          height: { ideal: 720 }
+        }
+      };
+
+      const stream = await navigator.mediaDevices.getUserMedia(constraints);
+      video.srcObject = stream;
+
+      // Wait until metadata is ready so videoWidth/videoHeight are valid
+      await new Promise(function (resolve, reject) {
+        if (video.readyState >= 1) return resolve();
+        video.onloadedmetadata = resolve;
+        setTimeout(function () {
+          reject(new Error('Timed out while waiting for the camera stream.'));
+        }, 15000);
+      });
+
+      await video.play();
+      console.log('Camera ready:', video.videoWidth + 'x' + video.videoHeight);
+    }
+
+    // ---------- Detection loop ----------
+    async function detectLoop() {
+      // Don't stack detections on top of each other
+      if (!isDetecting && model && video.readyState >= 2) {
+        isDetecting = true;
+        try {
+          const predictions = await model.detect(video);
+          updateCounter(predictions.length);
+          console.log('Predictions:', predictions);
+        } catch (err) {
+          console.error('Detection error:', err);
+        } finally {
+          isDetecting = false;
+        }
+      }
+      // Small delay keeps the CPU/GPU cooler on mobile than a pure rAF loop
+      setTimeout(function () {
+        requestAnimationFrame(detectLoop);
+      }, 60);
+    }
+
+    function updateCounter(count) {
+      counterNum.textContent = count;
+      counterEl.classList.toggle('has-objects', count > 0);
+    }
+
+    // ---------- Init ----------
+    async function init() {
+      try {
+        await setupCamera();
+      } catch (err) {
+        reportError('Camera error', err);
+        return;
+      }
+
+      try {
+        console.log('Loading COCO-SSD model...');
+        model = await cocoSsd.load();
+        console.log('Model loaded.');
+      } catch (err) {
+        reportError('Model load error', err);
+        return;
+      }
+
+      detectLoop();
+    }
+
+    // Pause the stream when the tab/app goes to background (saves battery)
+    document.addEventListener('visibilitychange', function () {
+      if (!video.srcObject) return;
+      video.srcObject.getVideoTracks().forEach(function (track) {
+        track.enabled = !document.hidden;
+      });
+    });
+
+    init();
+  })();
+  </script>
+
+</body>
+</html>
