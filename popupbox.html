@@ -1,0 +1,465 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+<meta name="theme-color" content="#000000" />
+<title>COCO-SSD · Camera + Boxes</title>
+<style>
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: #000;
+    color: #fff;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    overflow-x: hidden;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  /* ---------- Stage: video + canvas overlay ---------- */
+  #stage {
+    position: relative;
+    width: 100%;
+    line-height: 0;          /* kill inline gap under the video */
+    background: #000;
+  }
+
+  #video {
+    display: block;
+    width: 100%;
+    height: auto;
+    background: #000;
+  }
+
+  #overlay {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;    /* never block touches on the video */
+    z-index: 10;
+  }
+
+  /* ---------- Floating counter label ---------- */
+  #counter {
+    position: fixed;
+    top: calc(12px + env(safe-area-inset-top, 0px));
+    left: calc(12px + env(safe-area-inset-left, 0px));
+    z-index: 20;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 14px;
+    border-radius: 999px;
+    background: rgba(0, 0, 0, 0.60);
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.45);
+    font-size: 15px;
+    font-weight: 600;
+    letter-spacing: 0.3px;
+    color: #fff;
+    pointer-events: none;
+    user-select: none;
+    white-space: nowrap;
+  }
+
+  #counter .dot {
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    background: #ff5252;
+    box-shadow: 0 0 8px #ff5252;
+    transition: background 0.25s, box-shadow 0.25s;
+  }
+  #counter.has-objects .dot {
+    background: #4caf50;
+    box-shadow: 0 0 8px #4caf50;
+  }
+
+  #counter .num {
+    font-variant-numeric: tabular-nums;
+    min-width: 1ch;
+    text-align: center;
+  }
+
+  #counter .label {
+    font-weight: 500;
+    opacity: 0.8;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+  }
+
+  /* ---------- Error modal ---------- */
+  .modal {
+    position: fixed;
+    inset: 0;
+    z-index: 100;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+    background: rgba(0, 0, 0, 0.75);
+    backdrop-filter: blur(3px);
+    -webkit-backdrop-filter: blur(3px);
+  }
+  .modal.show { display: flex; }
+
+  .modal-box {
+    width: 100%;
+    max-width: 380px;
+    background: #1c1c1e;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 16px;
+    padding: 22px 20px 18px;
+    box-shadow: 0 18px 50px rgba(0, 0, 0, 0.6);
+    text-align: center;
+    animation: pop 0.18s ease-out;
+  }
+
+  @keyframes pop {
+    from { transform: scale(0.92); opacity: 0; }
+    to   { transform: scale(1);    opacity: 1; }
+  }
+
+  .modal-box h2 {
+    margin: 0 0 10px;
+    font-size: 17px;
+    font-weight: 700;
+  }
+
+  .modal-box p {
+    margin: 0 0 18px;
+    font-size: 14px;
+    line-height: 1.5;
+    color: #d0d0d5;
+    word-break: break-word;
+  }
+
+  .modal-box button {
+    width: 100%;
+    padding: 12px 16px;
+    font-size: 15px;
+    font-weight: 600;
+    color: #fff;
+    background: #0a84ff;
+    border: 0;
+    border-radius: 10px;
+    cursor: pointer;
+  }
+  .modal-box button:active { background: #0060df; }
+</style>
+</head>
+<body>
+
+  <!-- Camera feed + detection overlay -->
+  <div id="stage">
+    <video id="video" autoplay muted playsinline webkit-playsinline></video>
+    <canvas id="overlay"></canvas>
+  </div>
+
+  <!-- Floating object counter -->
+  <div id="counter" aria-live="polite">
+    <span class="dot"></span>
+    <span class="num" id="counter-num">0</span>
+    <span class="label">objects</span>
+  </div>
+
+  <!-- Error modal -->
+  <div class="modal" id="modal" role="alertdialog" aria-modal="true" aria-labelledby="modal-title">
+    <div class="modal-box">
+      <h2 id="modal-title">⚠️ Something went wrong</h2>
+      <p id="modal-msg"></p>
+      <button type="button" id="modal-close">OK</button>
+    </div>
+  </div>
+
+  <!-- Load TensorFlow.js (required for coco-ssd) -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs"></script>
+  <!-- Load the coco-ssd model -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd"></script>
+
+  <script>
+  (function () {
+    'use strict';
+
+    // ---------- DOM refs ----------
+    const video      = document.getElementById('video');
+    const canvas     = document.getElementById('overlay');
+    const ctx        = canvas.getContext('2d');
+    const counterEl  = document.getElementById('counter');
+    const counterNum = document.getElementById('counter-num');
+    const modal      = document.getElementById('modal');
+    const modalMsg   = document.getElementById('modal-msg');
+    const modalClose = document.getElementById('modal-close');
+
+    // ---------- State ----------
+    let model = null;
+    let isDetecting = false;
+    let lastCount = -1;
+
+    // ---------- Error helper: console + popup modal ----------
+    function reportError(title, err) {
+      const detail = (err && (err.message || err.toString())) || 'Unknown error';
+      console.error('[' + title + ']', err);
+      modalMsg.textContent = detail;
+      modal.classList.add('show');
+    }
+
+    modalClose.addEventListener('click', function () {
+      modal.classList.remove('show');
+    });
+
+    // Catch anything unexpected that escapes the try/catch blocks
+    window.addEventListener('error', function (e) {
+      reportError('Unhandled error', e.error || e.message);
+    });
+    window.addEventListener('unhandledrejection', function (e) {
+      reportError('Unhandled promise rejection', e.reason);
+    });
+
+    // ---------- Colors per class ----------
+    const PALETTE = [
+      '#ff5252', '#ffb142', '#ffe14d', '#7bed9f', '#48dbfb',
+      '#a29bfe', '#ff6b9d', '#f8a5c2', '#1dd1a1', '#54a0ff'
+    ];
+    const colorCache = new Map();
+
+    function colorFor(name) {
+      if (!colorCache.has(name)) {
+        colorCache.set(name, PALETTE[colorCache.size % PALETTE.length]);
+      }
+      return colorCache.get(name);
+    }
+
+    function hexToRgba(hex, alpha) {
+      const n = parseInt(hex.slice(1), 16);
+      const r = (n >> 16) & 255;
+      const g = (n >> 8) & 255;
+      const b = n & 255;
+      return 'rgba(' + r + ',' + g + ',' + b + ',' + alpha + ')';
+    }
+
+    // ---------- Canvas helpers ----------
+    function resizeCanvas() {
+      const rect = video.getBoundingClientRect();
+      const dpr = window.devicePixelRatio || 1;
+      const cssW = Math.max(1, Math.round(rect.width));
+      const cssH = Math.max(1, Math.round(rect.height));
+
+      const bw = Math.round(cssW * dpr);
+      const bh = Math.round(cssH * dpr);
+
+      if (canvas.width !== bw || canvas.height !== bh) {
+        canvas.width = bw;
+        canvas.height = bh;
+        // setting width/height resets the context state, so re-apply the DPR transform
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      }
+    }
+
+    function roundRect(c, x, y, w, h, r) {
+      const rr = Math.min(r, w / 2, h / 2);
+      c.beginPath();
+      c.moveTo(x + rr, y);
+      c.lineTo(x + w - rr, y);
+      c.quadraticCurveTo(x + w, y, x + w, y + rr);
+      c.lineTo(x + w, y + h - rr);
+      c.quadraticCurveTo(x + w, y + h, x + w - rr, y + h);
+      c.lineTo(x + rr, y + h);
+      c.quadraticCurveTo(x, y + h, x, y + h - rr);
+      c.lineTo(x, y + rr);
+      c.quadraticCurveTo(x, y, x + rr, y);
+      c.closePath();
+    }
+
+    // ---------- Draw predictions ----------
+    function drawPredictions(predictions) {
+      const cssW = canvas.clientWidth  || video.clientWidth;
+      const cssH = canvas.clientHeight || video.clientHeight;
+      if (!cssW || !cssH) return;
+
+      ctx.clearRect(0, 0, cssW, cssH);
+      if (!predictions || predictions.length === 0) return;
+
+      const vw = video.videoWidth;
+      const vh = video.videoHeight;
+      if (!vw || !vh) return;
+
+      // Model returns boxes in the video's intrinsic pixel space -> scale to display space
+      const scaleX = cssW / vw;
+      const scaleY = cssH / vh;
+
+      const fontSize = Math.max(11, Math.min(18, cssW * 0.032));
+      const padX = fontSize * 0.45;
+      const padY = fontSize * 0.34;
+      const lineWidth = Math.max(2, cssW * 0.005);
+
+      ctx.font = '600 ' + fontSize +
+        'px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif';
+      ctx.textBaseline = 'middle';
+      ctx.textAlign = 'left';
+      ctx.lineJoin = 'round';
+
+      for (let i = 0; i < predictions.length; i++) {
+        const p = predictions[i];
+        const box = p.bbox; // [x, y, width, height]
+        const bx = box[0] * scaleX;
+        const by = box[1] * scaleY;
+        const bw = box[2] * scaleX;
+        const bh = box[3] * scaleY;
+
+        if (bw <= 0 || bh <= 0) continue;
+
+        const color = colorFor(p.class);
+
+        // subtle translucent fill
+        ctx.fillStyle = hexToRgba(color, 0.14);
+        ctx.fillRect(bx, by, bw, bh);
+
+        // box outline
+        ctx.lineWidth = lineWidth;
+        ctx.strokeStyle = color;
+        ctx.strokeRect(bx, by, bw, bh);
+
+        // ---- label: "class 96%" ----
+        const label = p.class + ' ' + Math.round(p.score * 100) + '%';
+        const textW = ctx.measureText(label).width;
+        const labelW = textW + padX * 2;
+        const labelH = fontSize + padY * 2;
+
+        let lx = bx;
+        let ly = by - labelH;                 // above the box...
+        if (ly < 0) ly = by;                  // ...or inside it if there's no room
+
+        if (lx + labelW > cssW) lx = Math.max(0, cssW - labelW);
+        if (lx < 0) lx = 0;
+
+        ctx.fillStyle = color;
+        roundRect(ctx, lx, ly, labelW, labelH, Math.min(6, labelH / 2));
+        ctx.fill();
+
+        // text
+        ctx.fillStyle = '#ffffff';
+        ctx.fillText(label, lx + padX, ly + labelH / 2 + 0.5);
+      }
+    }
+
+    // ---------- Camera ----------
+    async function setupCamera() {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        throw new Error(
+          'Camera API is not available. Make sure the page is served over HTTPS (or localhost) and that your browser supports getUserMedia.'
+        );
+      }
+
+      const constraints = {
+        audio: false,
+        video: {
+          facingMode: { ideal: 'environment' }, // back camera
+          width:  { ideal: 1280 },
+          height: { ideal: 720 }
+        }
+      };
+
+      const stream = await navigator.mediaDevices.getUserMedia(constraints);
+      video.srcObject = stream;
+
+      // Wait until metadata is ready so videoWidth/videoHeight are valid
+      await new Promise(function (resolve, reject) {
+        if (video.readyState >= 1) return resolve();
+        video.onloadedmetadata = resolve;
+        setTimeout(function () {
+          reject(new Error('Timed out while waiting for the camera stream.'));
+        }, 15000);
+      });
+
+      await video.play();
+      resizeCanvas();
+      console.log('Camera ready:', video.videoWidth + 'x' + video.videoHeight);
+    }
+
+    // ---------- Detection loop ----------
+    async function detectLoop() {
+      if (!isDetecting && model && video.readyState >= 2) {
+        isDetecting = true;
+        try {
+          // Keep the canvas backing store in sync (rotation, resize, DPR change)
+          resizeCanvas();
+
+          const predictions = await model.detect(video);
+
+          updateCounter(predictions.length);
+          drawPredictions(predictions);
+
+          // Avoid flooding the console at ~15 fps: log only when the count changes
+          if (predictions.length !== lastCount) {
+            lastCount = predictions.length;
+            console.log('Predictions (' + predictions.length + '):', predictions);
+          }
+        } catch (err) {
+          console.error('Detection error:', err);
+        } finally {
+          isDetecting = false;
+        }
+      }
+
+      // Small delay keeps the CPU/GPU cooler on mobile than a pure rAF loop
+      setTimeout(function () {
+        requestAnimationFrame(detectLoop);
+      }, 60);
+    }
+
+    function updateCounter(count) {
+      counterNum.textContent = count;
+      counterEl.classList.toggle('has-objects', count > 0);
+    }
+
+    // ---------- Init ----------
+    async function init() {
+      try {
+        await setupCamera();
+      } catch (err) {
+        reportError('Camera error', err);
+        return;
+      }
+
+      try {
+        console.log('Loading COCO-SSD model...');
+        model = await cocoSsd.load();
+        console.log('Model loaded.');
+      } catch (err) {
+        reportError('Model load error', err);
+        return;
+      }
+
+      detectLoop();
+    }
+
+    // ---------- Resize / orientation ----------
+    window.addEventListener('resize', resizeCanvas);
+    window.addEventListener('orientationchange', function () {
+      setTimeout(resizeCanvas, 300);
+    });
+    video.addEventListener('loadedmetadata', resizeCanvas);
+
+    // Pause the stream when the tab/app goes to background (saves battery)
+    document.addEventListener('visibilitychange', function () {
+      if (!video.srcObject) return;
+      video.srcObject.getVideoTracks().forEach(function (track) {
+        track.enabled = !document.hidden;
+      });
+      if (!document.hidden) resizeCanvas();
+    });
+
+    init();
+  })();
+  </script>
+
+</body>
+</html>
